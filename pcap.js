@@ -1370,7 +1370,9 @@ TLSParser.prototype = {
     'c02f': {
       suite: 'TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256',
       // https://tools.ietf.org/html/rfc5116#section-5.1
-      ciphertextGrowth: 16
+      // 8 bytes for the CTR nonce
+      // 16 bytes for the authentication tag
+      ciphertextGrowth: 24
     }
   },
   parseHandshake: function(data, tls, off) {
