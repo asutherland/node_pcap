@@ -1323,7 +1323,6 @@ TLSParser.prototype = {
     while (off < data.length) {
       var tlsRec = { sender: sender };
       tlsRecs.push(tlsRec);
-      console.log('off:', off.toString(16));
       off += this.parseTLS(data, tlsRec, off);
     }
   },
