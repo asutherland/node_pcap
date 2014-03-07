@@ -141,11 +141,20 @@ var unpack = {
 
         return res.join(":");
     },
+    // read a 16-bit big-endian/network-byte-order value starting from offset
     uint16: function (raw_packet, offset) {
         return ((raw_packet[offset] * 256) + raw_packet[offset + 1]);
     },
+    // read a 16-bit little-endian value starting from offset. misnamed unless
+    // this stands for "backwards endian"
     uint16_be: function (raw_packet, offset) {
         return ((raw_packet[offset+1] * 256) + raw_packet[offset]);
+    },
+    // read a 24-bit big-endian/network-byte-order value starting from offset
+    uint24: function (raw_packet, offset) {
+        return ((raw_packet[offset] * 65536) +
+                (raw_packet[offset + 1] * 256) +
+                raw_packet[offset + 2]);
     },
     uint32: function (raw_packet, offset) {
         return (
@@ -1300,6 +1309,138 @@ print.packet = function (packet_to_print) {
 
 exports.print = print;
 
+function TLSParser(tracker, session) {
+  this.ciphertextGrowth = null;
+
+}
+TLSParser.prototype = {
+  parse: function(sender, tcp) {
+    var data = tcp.data;
+
+    var tlsRecs = tcp.tls = [];
+    var off = 0;
+
+    while (off < data.length) {
+      var tlsRec = { sender: sender };
+      tlsRecs.push(tlsRec);
+      console.log('off:', off.toString(16));
+      off += this.parseTLS(data, tlsRec, off);
+    }
+  },
+
+  parseTLS: function(data, tls, off) {
+    var type = data[off];
+    var length = unpack.uint16(data, off + 3);
+    off += 5;
+
+    switch (type) {
+      case 0x14:
+        tls.contentType = 'ChangeCipherSpec';
+        tls.length = length;
+        this.parseChangeCipherSpec(data, tls, off);
+        break;
+      case 0x15:
+        tls.contentType = 'Alert';
+        tls.length = length;
+        this.parseAlert(data, tls, off);
+        break;
+      case 0x16:
+        tls.contentType = 'Handshake';
+        tls.length = length;
+        tls.handshakes = [];
+        while (off < data.length) {
+          off += this.parseHandshake(data, tls, off);
+        }
+        break;
+      case 0x17:
+        tls.contentType = 'Application';
+        tls.length = length;
+        this.parseApplication(data, tls, off);
+        break;
+    }
+
+    return 5 + length;
+  },
+
+  parseChangeCipherSpec: function(data, tls) {
+  },
+  parseAlert: function(data, tls) {
+  },
+  CIPHER_SUITES: {
+    // https://tools.ietf.org/html/rfc5289#section-3.2
+    'c02f': {
+      suite: 'TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256',
+      // https://tools.ietf.org/html/rfc5116#section-5.1
+      ciphertextGrowth: 16
+    }
+  },
+  parseHandshake: function(data, tls, off) {
+    var type = data[off];
+    var length = unpack.uint24(data, off + 1);
+    var shake = { type: null, length: length };
+    tls.handshakes.push(shake);
+
+    switch (type) {
+      case 0:
+        shake.type = 'HelloRequest';
+        break;
+      case 1:
+        shake.type = 'ClientHello';
+        break;
+      case 2:
+        shake.type = 'ServerHello';
+        // for start at 0x48, cipher suite is at 0x8e
+        var cipherHex = data[off + 71].toString(16) +
+                        data[off + 72].toString(16);
+        if (this.CIPHER_SUITES.hasOwnProperty(cipherHex)) {
+          var cipher = this.CIPHER_SUITES[cipherHex];
+          shake.cipherSuite = cipher.suite;
+          this.ciphertextGrowth = cipher.ciphertextGrowth;
+        }
+        else {
+          shake.cipherSuite = cipherHex;
+        }
+        break;
+      case 4:
+        shake.type = 'NewSessionTicket';
+        break;
+      case 11:
+        shake.type = 'Certificate';
+        break;
+      case 12:
+        shake.type = 'ServerKeyExchange';
+        break;
+      case 13:
+        shake.type = 'CertificateRequest';
+        break;
+      case 14:
+        shake.type = 'ServerHelloDone';
+        break;
+      case 15:
+        shake.type = 'CertificateVerify';
+        break;
+      case 16:
+        shake.type = 'ClientKeyExchanged';
+        break;
+      case 20:
+        shake.type = 'Finished';
+        break;
+      default:
+        // is this a MAC?  should we know it.
+        shake.type = 'Unknown: 0x' + type.toString(16);
+        break;
+    }
+
+    return length + 4;
+  },
+
+  parseApplication: function(data, tls, off) {
+    if (this.ciphertextGrowth) {
+      tls.appDataLength = tls.length - this.ciphertextGrowth;
+    }
+  }
+};
+
 // Meaningfully hold the different types of frames at some point
 function WebSocketFrame() {
     this.type = null;
@@ -1372,6 +1513,27 @@ TCP_tracker.prototype.detect_http_request = function (buf) {
     var str = buf.toString('utf8', 0, buf.length);
 
     return (/^(OPTIONS|GET|HEAD|POST|PUT|DELETE|TRACE|CONNECT|COPY|LOCK|MKCOL|MOVE|PROPFIND|PROPPATCH|UNLOCK) [^\s\r\n]+ HTTP\/\d\.\d\r\n/.test(str));
+};
+
+TCP_tracker.prototype.detect_tls_request = function(buf) {
+    // There needs to be at least enough data for our detection, although we
+    // should probably require more.
+    return buf.length > 16 &&
+           // Handshake content type is 0x16.
+           buf[0] === 0x16 &&
+           // Major version should be 3
+           buf[1] === 0x3 &&
+           // Minor version should be [0, 3]
+           buf[2] >= 0x0 && buf[2] <= 0x3 &&
+           // 3:4: We ignore the length, especially since there are weird
+           // interop things going on lately, although we could enforce
+           // some relationship between this outer length and the first
+           // handshake mesage's length.
+           // 5: The handshake type should be client hello
+           buf[5] === 0x1 &&
+           // We should see a TLS version-looking thing again: 3, [0,3]
+           buf[9] === 0x3 &&
+           buf[10] >= 0x0 && buf[10] <= 0x3;
 };
 
 TCP_tracker.prototype.session_stats = function (session) {
@@ -1508,6 +1670,12 @@ TCP_tracker.prototype.setup_http_tracking = function (session) {
   session.http = http;
 };
 
+TCP_tracker.prototype.setup_tls_tracking = function(session) {
+  var self = this;
+
+  session.tls = new TLSParser(this, session);
+};
+
 TCP_tracker.prototype.setup_websocket_tracking = function (session, flag) {
     var self = this;
 
@@ -1584,6 +1752,11 @@ TCP_tracker.prototype.track_states.ESTAB = function (packet, session) {
                 if (session.http_detect) {
                     this.setup_http_tracking(session);
                 }
+
+                session.tls_detect = this.detect_tls_request(tcp.data);
+                if (session.tls_detect) {
+                    this.setup_tls_tracking(session);
+                }
             }
             session.send_bytes_payload += tcp.data_bytes;
             if (session.send_packets[tcp.seqno + tcp.data_bytes]) {
@@ -1595,6 +1768,8 @@ TCP_tracker.prototype.track_states.ESTAB = function (packet, session) {
                     } catch (request_err) {
                         this.emit('http error', session, "send", request_err);
                     }
+                } else if (session.tls_detect) {
+                    session.tls.parse('client', tcp);
                 } else if (session.websocket_detect) {
                     session.websocket_parser_send.execute(tcp.data);
                     // TODO - check for WS parser errors
@@ -1633,6 +1808,8 @@ TCP_tracker.prototype.track_states.ESTAB = function (packet, session) {
                     } catch (response_err) {
                         this.emit('http error', session, "recv", response_err);
                     }
+                } else if (session.tls_detect) {
+                    session.tls.parse('server', tcp);
                 } else if (session.websocket_detect) {
                     session.websocket_parser_recv.execute(tcp.data);
                     // TODO - check for WS parser errors
